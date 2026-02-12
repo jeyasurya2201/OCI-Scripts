@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+OCI Sandbox Compartment Resource Inventory
+
+Description:
+------------
+This script extracts a complete inventory of Oracle Cloud Infrastructure (OCI)
+resources that exist within the 'Sandbox' compartment and all of its child
+compartments recursively.
+
+The inventory includes full compartment hierarchy paths and is exported
+as a CSV file for audit, compliance, and reference purposes.
+
+Safety:
+-------
+READ-ONLY SCRIPT
+No OCI resources are created, modified, or deleted.
+
+Author:
+-------
+Jeya Surya
+"""
+
+import oci
+import os
+import csv
+import shutil
+
+# ==================================================
+# CONFIGURATION
+# ==================================================
+OCI_PROFILE = "DEFAULT"
+ROOT_COMPARTMENT_NAME = "Sandbox"
+
+OUTPUT_DIR = "oci_sandbox_resource_inventory"
+EXPORT_DIR = os.path.join(OUTPUT_DIR, "export")
+
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# ==================================================
+# OCI CLIENT INITIALIZATION
+# ==================================================
+config = oci.config.from_file(profile_name=OCI_PROFILE)
+identity_client = oci.identity.IdentityClient(config)
+search_client = oci.resource_search.ResourceSearchClient(config)
+
+TENANCY_OCID = config["tenancy"]
+
+# ==================================================
+# FETCH ALL COMPARTMENTS
+# ==================================================
+def fetch_all_compartments():
+    """Retrieve all compartments in the tenancy."""
+    compartments = []
+    page = None
+
+    while True:
+        response = identity_client.list_compartments(
+            TENANCY_OCID,
+            compartment_id_in_subtree=True,
+            limit=500,
+            page=page
+        )
+        compartments.extend(response.data)
+        page = response.headers.get("opc-next-page")
+        if not page:
+            break
+
+    return compartments
+
+
+all_compartments = fetch_all_compartments()
+
+# Compartment lookup map
+compartment_map = {c.id: c for c in all_compartments}
+
+# Add tenancy for path construction
+tenancy = identity_client.get_tenancy(TENANCY_OCID).data
+compartment_map[tenancy.id] = tenancy
+
+# ==================================================
+# IDENTIFY SANDBOX ROOT
+# ==================================================
+sandbox_root = next(
+    (c for c in all_compartments if c.name.lower() == ROOT_COMPARTMENT_NAME.lower()),
+    None
+)
+
+if not sandbox_root:
+    raise SystemExit("Sandbox compartment not found.")
+
+print(f"[INFO] Sandbox compartment identified: {sandbox_root.id}")
+
+# ==================================================
+# RECURSIVE CHILD COMPARTMENTS
+# ==================================================
+def get_child_compartments(parent_id):
+    children = []
+    for comp in all_compartments:
+        if comp.compartment_id == parent_id:
+            children.append(comp)
+            children.extend(get_child_compartments(comp.id))
+    return children
+
+
+target_compartments = [sandbox_root] + get_child_compartments(sandbox_root.id)
+print(f"[INFO] Total compartments scanned: {len(target_compartments)}")
+
+# ==================================================
+# BUILD COMPARTMENT PATH
+# ==================================================
+def build_compartment_path(compartment_id):
+    path = []
+    current = compartment_map.get(compartment_id)
+
+    while current:
+        path.append(current.name)
+        parent_id = getattr(current, "compartment_id", None)
+        current = compartment_map.get(parent_id)
+
+    return "/".join(reversed(path))
+
+
+# ==================================================
+# RESOURCE SEARCH
+# ==================================================
+inventory = []
+
+for comp in target_compartments:
+    comp_path = build_compartment_path(comp.id)
+    print(f"[INFO] Scanning: {comp_path}")
+
+    query = f"query all resources where compartmentId = '{comp.id}'"
+    search_details = oci.resource_search.models.StructuredSearchDetails(
+        query=query,
+        type="Structured"
+    )
+
+    page = None
+    while True:
+        response = search_client.search_resources(
+            search_details,
+            limit=500,
+            page=page
+        )
+
+        for res in response.data.items:
+            inventory.append([
+                comp.name,
+                comp.id,
+                comp_path,
+                res.display_name,
+                res.resource_type,
+                res.identifier,
+                res.lifecycle_state,
+                res.time_created
+            ])
+
+        page = response.headers.get("opc-next-page")
+        if not page:
+            break
+
+# ==================================================
+# EXPORT CSV
+# ==================================================
+csv_file = os.path.join(EXPORT_DIR, "sandbox_resource_inventory.csv")
+
+with open(csv_file, "w", newline="") as file:
+    writer = csv.writer(file)
+    writer.writerow([
+        "CompartmentName",
+        "CompartmentOCID",
+        "CompartmentPath",
+        "ResourceName",
+        "ResourceType",
+        "ResourceOCID",
+        "LifecycleState",
+        "TimeCreated"
+    ])
+    writer.writerows(inventory)
+
+# ==================================================
+# ZIP OUTPUT
+# ==================================================
+zip_file = shutil.make_archive(
+    "sandbox_resource_inventory",
+    "zip",
+    EXPORT_DIR
+)
+
+print("\n[INFO] Inventory export completed successfully")
+print(f"[INFO] CSV : {csv_file}")
+print(f"[INFO] ZIP : {zip_file}")
+print("[INFO] Script execution completed (READ-ONLY)")
